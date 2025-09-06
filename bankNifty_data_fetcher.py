@@ -14,21 +14,29 @@ from ratelimit import limits, sleep_and_retry
 from functools import lru_cache
 import json
 from pathlib import Path
+from ta import momentum
 
 ist = pytz.timezone('Asia/Kolkata')
 
 class DataFetcher:
-    def __init__(self, api_key, access_token):
+    def __init__(self, api_key, access_token, kite):
         self.api_key = api_key
         self.access_token = access_token
-        self.kite = KiteConnect(api_key=api_key)
-        self.kite.set_access_token(access_token)
+        self.kite = kite
         self.data_cache = {}
         self.cache_timestamps = {}
-        self.banknifty_token = self.get_banknifty_token()
+        self.banknifty_token = None
         self.token_bucket = TokenBucket(tokens=Config.API_RATE_LIMIT, 
                                       fill_rate=Config.API_RATE_LIMIT/Config.API_RATE_LIMIT_PERIOD)
         self._initialize_cache()
+
+    @classmethod
+    async def create(cls, api_key, access_token):
+        kite = KiteConnect(api_key=api_key)
+        kite.set_access_token(access_token)
+        instance = cls(api_key, access_token, kite)
+        instance.banknifty_token = await instance.get_banknifty_token()
+        return instance
 
     def _initialize_cache(self):
         """Initialize data cache with required categories"""
@@ -42,11 +50,23 @@ class DataFetcher:
         }
         self.cache_timestamps = {k: None for k in self.data_cache.keys()}
 
+    async def get_banknifty_token(self, exchange='NFO'):
+        """Get instrument token for Bank Nifty"""
+        try:
+            instruments = await asyncio.to_thread(self.kite.instruments, exchange)
+            for instrument in instruments:
+                if instrument['tradingsymbol'] == 'BANKNIFTY':
+                    return instrument['instrument_token']
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching banknifty token: {e}")
+            return None
+
     @backoff.on_exception(backoff.expo,
                          (RequestException, Timeout),
                          max_tries=5,
                          max_time=300)
-    def fetch_all_data(self):
+    async def fetch_all_data(self):
         """Fetch all required data in parallel"""
         try:
             logger.info("Fetching all market data...")
@@ -62,7 +82,7 @@ class DataFetcher:
             ]
             
             # Run all tasks concurrently
-            results = asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
             
             data = {
                 'historical_data': results[0],
@@ -107,7 +127,7 @@ class DataFetcher:
                 return self.data_cache.get(cache_key)  # Return cached data if available
 
             # Process the data
-            data = self._process_historical_data(data)
+            data = await asyncio.to_thread(self._process_historical_data, data)
             
             # Update cache
             self.data_cache[cache_key] = data
@@ -142,14 +162,14 @@ class DataFetcher:
                 return self.data_cache.get(cache_key)
 
             # Process options data
-            processed_data = self._process_options_data(options_data, spot_price)
+            processed_data = await asyncio.to_thread(self._process_options_data, options_data, spot_price)
             
             # Calculate additional metrics
             processed_data.update({
-                'put_call_ratio': self._calculate_put_call_ratio(options_data),
-                'iv_skew': self._calculate_iv_skew(options_data, spot_price),
-                'max_pain': self._calculate_max_pain(options_data),
-                'options_sentiment': self._analyze_options_sentiment(options_data)
+                'put_call_ratio': await asyncio.to_thread(self._calculate_put_call_ratio, options_data),
+                'iv_skew': await asyncio.to_thread(self._calculate_iv_skew, options_data, spot_price),
+                'max_pain': await asyncio.to_thread(self._calculate_max_pain, options_data),
+                'options_sentiment': await asyncio.to_thread(self._analyze_options_sentiment, options_data)
             })
 
             # Update cache
@@ -170,10 +190,10 @@ class DataFetcher:
             if self._is_cache_valid(cache_key, max_age_seconds=30):  # 30 seconds cache
                 return self.data_cache[cache_key]
 
-            market_depth = await self._fetch_kite_market_depth(self.banknifty_token)
+            market_depth = await self._fetch_kite_depth(self.banknifty_token)
             
             if market_depth:
-                processed_depth = self._process_market_depth(market_depth)
+                processed_depth = await asyncio.to_thread(self._process_market_depth, market_depth)
                 
                 # Update cache
                 self.data_cache[cache_key] = processed_depth
@@ -204,7 +224,7 @@ class DataFetcher:
                 'news_sentiment': news_sentiment,
                 'social_sentiment': social_sentiment,
                 'market_mood': market_mood,
-                'combined_sentiment': self._calculate_combined_sentiment(
+                'combined_sentiment': await asyncio.to_thread(self._calculate_combined_sentiment,
                     news_sentiment, social_sentiment, market_mood
                 )
             }
@@ -229,17 +249,17 @@ class DataFetcher:
 
             # Calculate historical volatility
             historical_data = await self.fetch_historical_data()
-            hist_volatility = self._calculate_historical_volatility(historical_data)
+            hist_volatility = await asyncio.to_thread(self._calculate_historical_volatility, historical_data)
 
             # Get implied volatility from options
             options_data = await self.fetch_options_chain_data()
-            implied_volatility = self._calculate_implied_volatility(options_data)
+            implied_volatility = await asyncio.to_thread(self._calculate_implied_volatility, options_data)
 
             volatility_data = {
                 'historical_volatility': hist_volatility,
                 'implied_volatility': implied_volatility,
                 'volatility_spread': implied_volatility - hist_volatility,
-                'volatility_trend': self._analyze_volatility_trend(historical_data)
+                'volatility_trend': await asyncio.to_thread(self._analyze_volatility_trend, historical_data)
             }
 
             # Update cache
@@ -267,8 +287,10 @@ class DataFetcher:
             declining = 0
             total_volume = 0
             
-            for stock in bank_nifty_stocks:
-                stock_data = await self._fetch_stock_data(stock)
+            tasks = [self._fetch_stock_data(stock) for stock in bank_nifty_stocks]
+            stock_data_list = await asyncio.gather(*tasks)
+
+            for stock_data in stock_data_list:
                 if stock_data['close'] > stock_data['prev_close']:
                     advancing += 1
                 else:
@@ -278,8 +300,8 @@ class DataFetcher:
             breadth_data = {
                 'advance_decline_ratio': advancing / declining if declining > 0 else float('inf'),
                 'market_breadth': (advancing - declining) / (advancing + declining),
-                'volume_trend': self._analyze_volume_trend(total_volume),
-                'market_strength': self._calculate_market_strength(bank_nifty_stocks)
+                'volume_trend': await asyncio.to_thread(self._analyze_volume_trend, total_volume),
+                'market_strength': await asyncio.to_thread(self._calculate_market_strength, bank_nifty_stocks)
             }
 
             # Update cache
@@ -405,14 +427,14 @@ class DataFetcher:
             logger.error(f"Error analyzing volume trend: {e}")
             return 'neutral'
 
-    def _analyze_market_mood(self):
+    async def _analyze_market_mood(self):
         """Analyze overall market mood using multiple indicators"""
         try:
             indicators = {
-                'price_trend': self._analyze_price_trend(),
-                'volume_trend': self._analyze_volume_trend(self.data_cache.get('historical_data', {}).get('volume', 0)),
-                'options_sentiment': self._analyze_options_sentiment(self.data_cache.get('options_chain')),
-                'market_breadth': self._analyze_market_breadth()
+                'price_trend': await asyncio.to_thread(self._analyze_price_trend),
+                'volume_trend': await asyncio.to_thread(self._analyze_volume_trend, self.data_cache.get('historical_data', {}).get('volume', 0)),
+                'options_sentiment': await asyncio.to_thread(self._analyze_options_sentiment, self.data_cache.get('options_chain')),
+                'market_breadth': await asyncio.to_thread(self._analyze_market_breadth)
             }
             
             # Calculate mood score
@@ -481,15 +503,34 @@ class DataFetcher:
     async def _fetch_kite_historical(self, instrument_token, from_date, to_date, interval):
         """Fetch historical data from Kite"""
         try:
-            data = await self.kite.historical_data(
-                instrument_token=instrument_token,
-                from_date=from_date,
-                to_date=to_date,
-                interval=interval
+            data = await asyncio.to_thread(
+                self.kite.historical_data,
+                instrument_token,
+                from_date,
+                to_date,
+                interval
             )
             return pd.DataFrame(data)
         except Exception as e:
             logger.error(f"Error fetching Kite historical data: {e}")
+            return None
+
+    async def _fetch_kite_depth(self, instrument_token):
+        """Fetch market depth from Kite"""
+        try:
+            depth = await asyncio.to_thread(self.kite.depth, instrument_token)
+            return depth
+        except Exception as e:
+            logger.error(f"Error fetching Kite market depth: {e}")
+            return None
+
+    async def _fetch_spot_price(self):
+        """Fetch spot price for BankNifty"""
+        try:
+            quote = await asyncio.to_thread(self.kite.ltp, f"NFO:BANKNIFTY")
+            return quote[f"NFO:BANKNIFTY"]['last_price']
+        except Exception as e:
+            logger.error(f"Error fetching spot price: {e}")
             return None
 
     async def _fetch_bank_nifty_stocks(self):
@@ -533,6 +574,31 @@ class DataFetcher:
         except Exception as e:
             logger.error(f"Error fetching options around price: {e}")
             return []
+
+    async def _fetch_option_data(self, session, strike, option_type):
+        # This is a dummy implementation. You need to replace it with actual API calls to fetch option data.
+        return {
+            'instrument_type': option_type,
+            'strike': strike,
+            'last_price': 100,
+            'implied_volatility': 0.2,
+            'delta': 0.5,
+            'gamma': 0.1,
+            'theta': -0.1,
+            'vega': 0.2,
+            'open_interest': 1000,
+            'volume': 100
+        }
+
+
+    async def _fetch_stock_data(self, stock_symbol):
+        # This is a dummy implementation. You need to replace it with actual API calls to fetch stock data.
+        return {
+            'close': 100,
+            'prev_close': 99,
+            'volume': 10000
+        }
+
 
     async def _fetch_news_sentiment(self):
         """Fetch and analyze news sentiment"""
@@ -669,6 +735,67 @@ class DataFetcher:
         except Exception as e:
             logger.error(f"Error assessing data quality: {e}")
             return {}
+
+    def _calculate_put_call_ratio(self, options_data):
+        """
+        Calculate Put-Call Ratio
+        options_data: list of option data dictionaries
+        """
+        call_volume = sum(opt['volume'] for opt in options_data if opt['instrument_type'] == 'CE')
+        put_volume = sum(opt['volume'] for opt in options_data if opt['instrument_type'] == 'PE')
+        
+        if call_volume == 0:
+            return float('inf')  # Avoid division by zero
+        
+        return put_volume / call_volume
+
+    def _calculate_iv_skew(self, options_data, spot_price):
+        # This is a dummy implementation. You need to provide the logic for IV skew calculation.
+        logger.warning("IV Skew calculation is a dummy implementation.")
+        return 0.0
+
+    def _calculate_max_pain(self, options_data):
+        # This is a dummy implementation. You need to provide the logic for max pain calculation.
+        logger.warning("Max pain calculation is a dummy implementation.")
+        return 30000
+
+    def _analyze_options_sentiment(self, options_data):
+        # This is a dummy implementation. You need to provide the logic for options sentiment analysis.
+        logger.warning("Options sentiment analysis is a dummy implementation.")
+        return 'neutral'
+
+    def _process_market_depth(self, market_depth):
+        # This is a dummy implementation. You need to provide the logic for processing market depth.
+        logger.warning("Market depth processing is a dummy implementation.")
+        return market_depth
+
+    def _calculate_market_strength(self, bank_nifty_stocks):
+        # This is a dummy implementation. You need to provide the logic for market strength calculation.
+        logger.warning("Market strength calculation is a dummy implementation.")
+        return 0.5
+
+    def _find_atm_strike(self, options_data, spot_price):
+        # This is a dummy implementation. You need to provide the logic for finding the ATM strike.
+        logger.warning("ATM strike finding is a dummy implementation.")
+        return round(spot_price / 100) * 100
+
+    def _calculate_rsi(self, close_prices, window=14):
+        return momentum.RSIIndicator(close_prices, window=window).rsi().iloc[-1]
+
+    def _calculate_vwap(self, data):
+        return (data['volume'] * (data['high'] + data['low'] + data['close']) / 3).cumsum() / data['volume'].cumsum().iloc[-1]
+    
+    def _analyze_market_breadth(self, stock_data_list):
+        advancing = sum(1 for stock in stock_data_list if stock['close'] > stock['close'])
+        declining = sum(1 for stock in stock_data_list if stock['close'] < stock['close'])
+
+        if advancing > declining:
+            return 'bullish'
+        elif declining > advancing:
+            return 'bearish'
+        else:
+            return 'neutral'
+
 
 class TokenBucket:
     def __init__(self, tokens, fill_rate):

@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 
 # Import our new modular components
-from utils.config_loader import load_config
-from utils.logging_config import setup_logging
+from bankNifty_config_loader import load_config
+from bankNifty_logging_config import setup_logging
 # from data.market_data import MarketData # Assuming this will handle Kite connection
 # from execution.order_manager import OrderManager
 # from features.indicators import add_indicators_to_dataframe
